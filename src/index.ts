@@ -8,6 +8,8 @@ import { z } from "zod";
 import path from "path";
 import os from "os";
 import fs from "fs";
+import { Client } from "ssh2";
+import { createSetupTool } from "./setup-tool.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,8 +23,152 @@ const TMP_ROOT_DIR = fs.mkdtempSync(
   path.join(os.tmpdir(), "ios-simulator-mcp-")
 );
 
+// SSH Configuration
+interface SSHConfig {
+  host: string;
+  port: number;
+  username: string;
+  privateKeyPath?: string;
+  password?: string;
+}
+
+// Read SSH configuration from environment variables
+function getSSHConfig(): SSHConfig | null {
+  const host = process.env.IOS_SIMULATOR_SSH_HOST;
+  if (!host) return null;
+
+  return {
+    host,
+    port: parseInt(process.env.IOS_SIMULATOR_SSH_PORT || "22"),
+    username: process.env.IOS_SIMULATOR_SSH_USERNAME || "user",
+    privateKeyPath: process.env.IOS_SIMULATOR_SSH_KEY_PATH,
+    password: process.env.IOS_SIMULATOR_SSH_PASSWORD,
+  };
+}
+
+/**
+ * Creates SSH connection options based on configuration
+ */
+function createSSHConnectionOptions() {
+  if (!sshConfig) {
+    throw new Error("SSH configuration not available");
+  }
+
+  const connectOptions: any = {
+    host: sshConfig.host,
+    port: sshConfig.port,
+    username: sshConfig.username,
+  };
+
+  if (sshConfig.privateKeyPath) {
+    connectOptions.privateKey = fs.readFileSync(sshConfig.privateKeyPath);
+  } else if (sshConfig.password) {
+    connectOptions.password = sshConfig.password;
+  } else {
+    connectOptions.agent = process.env.SSH_AUTH_SOCK;
+  }
+
+  return connectOptions;
+}
+
+/**
+ * Executes a command over SSH with proper shell environment
+ */
+async function sshExec(command: string): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    
+    conn.on('ready', () => {
+      const fullCommand = `source ~/.zshrc 2>/dev/null || source ~/.bash_profile 2>/dev/null || true; ${command}`;
+      conn.exec(fullCommand, (err, stream) => {
+        if (err) {
+          conn.end();
+          reject(err);
+          return;
+        }
+
+        let stdout = '';
+        let stderr = '';
+
+        stream.on('close', (code: number) => {
+          conn.end();
+          if (code === 0) {
+            resolve({
+              stdout: stdout.trim(),
+              stderr: stderr.trim(),
+            });
+          } else {
+            reject(new Error(`Command failed with exit code ${code}: ${stderr || stdout}`));
+          }
+        });
+
+        stream.on('data', (data: Buffer) => {
+          stdout += data.toString();
+        });
+
+        stream.stderr?.on('data', (data: Buffer) => {
+          stderr += data.toString();
+        });
+      });
+    });
+
+    conn.on('error', (err) => {
+      reject(err);
+    });
+
+    conn.connect(createSSHConnectionOptions());
+  });
+}
+
+/**
+ * Get the full path to the idb command for SSH execution
+ * First tries environment variable, then tries common locations
+ */
+async function getIdbPath(): Promise<string> {
+  // Check if custom path is specified
+  const customPath = process.env.IOS_SIMULATOR_IDB_PATH;
+  if (customPath) {
+    return customPath;
+  }
+
+  // Try to find idb in common locations
+  const commonPaths = [
+    'idb', // Try system PATH first
+    '/opt/homebrew/bin/idb',
+    '/usr/local/bin/idb',
+    '$HOME/.local/bin/idb',
+  ];
+
+  for (const path of commonPaths) {
+    try {
+      await sshExec(`which ${path}`);
+      return path;
+    } catch {
+      // Continue to next path
+    }
+  }
+
+  // Try Python user bin directory (common for pip installs)
+  try {
+    const { stdout } = await sshExec('python3 -m site --user-base');
+    const userBase = stdout.trim();
+    const pythonIdbPath = `${userBase}/bin/idb`;
+    await sshExec(`test -f ${pythonIdbPath}`);
+    return pythonIdbPath;
+  } catch {
+    // Fall back to idb if nothing else works
+    return 'idb';
+  }
+}
+
+const sshConfig = getSSHConfig();
+
+// Global variable to track SSH recording info
+let sshRecordingInfo: { remotePath: string; localPath: string } | null = null;
+
 /**
  * Runs a command with arguments and returns the stdout and stderr
+ * Automatically routes to SSH execution if SSH configuration is present
  * @param cmd - The command to run
  * @param args - The arguments to pass to the command
  * @returns The stdout and stderr of the command
@@ -31,11 +177,75 @@ async function run(
   cmd: string,
   args: string[]
 ): Promise<{ stdout: string; stderr: string }> {
-  const { stdout, stderr } = await execFileAsync(cmd, args, { shell: false });
-  return {
-    stdout: stdout.trim(),
-    stderr: stderr.trim(),
-  };
+  if (sshConfig) {
+    return runSSH(cmd, args);
+  } else {
+    const { stdout, stderr } = await execFileAsync(cmd, args, { shell: false });
+    return {
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+    };
+  }
+}
+
+// Cache for idb path to avoid repeated lookups
+let cachedIdbPath: string | null = null;
+
+/**
+ * Runs a command over SSH with argument escaping and idb path resolution
+ */
+async function runSSH(
+  cmd: string,
+  args: string[]
+): Promise<{ stdout: string; stderr: string }> {
+  // Resolve idb path if needed
+  let finalCmd = cmd;
+  if (cmd === 'idb') {
+    if (!cachedIdbPath) {
+      cachedIdbPath = await getIdbPath();
+    }
+    finalCmd = cachedIdbPath;
+  }
+
+  // Escape arguments for shell execution
+  const escapedArgs = args.map(arg => `'${arg.replace(/'/g, "'\"'\"'")}'`);
+  const command = `${finalCmd} ${escapedArgs.join(' ')}`;
+  
+  return sshExec(command);
+}
+
+/**
+ * Downloads a file from the remote macOS host via SSH
+ */
+async function downloadFileSSH(remotePath: string, localPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    
+    conn.on('ready', () => {
+      conn.sftp((err, sftp) => {
+        if (err) {
+          conn.end();
+          reject(err);
+          return;
+        }
+
+        sftp.fastGet(remotePath, localPath, (err) => {
+          conn.end();
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
+      });
+    });
+
+    conn.on('error', (err) => {
+      reject(err);
+    });
+
+    conn.connect(createSSHConnectionOptions());
+  });
 }
 
 // Read filtered tools from environment variable
@@ -467,11 +677,18 @@ if (!isToolFiltered("ui_view")) {
 
         // Generate unique file names with timestamp
         const ts = Date.now();
-        const rawPng = path.join(TMP_ROOT_DIR, `ui-view-${ts}-raw.png`);
-        const compressedJpg = path.join(
-          TMP_ROOT_DIR,
-          `ui-view-${ts}-compressed.jpg`
-        );
+        let rawPng: string;
+        let compressedJpg: string;
+        
+        if (sshConfig) {
+          // Use remote paths when SSH is configured
+          rawPng = `/tmp/ui-view-${ts}-raw.png`;
+          compressedJpg = `/tmp/ui-view-${ts}-compressed.jpg`;
+        } else {
+          // Use local temp directory when running locally
+          rawPng = path.join(TMP_ROOT_DIR, `ui-view-${ts}-raw.png`);
+          compressedJpg = path.join(TMP_ROOT_DIR, `ui-view-${ts}-compressed.jpg`);
+        }
 
         // Capture screenshot as PNG
         await run("xcrun", [
@@ -501,7 +718,18 @@ if (!isToolFiltered("ui_view")) {
         ]);
 
         // Read and encode the compressed image
-        const imageData = fs.readFileSync(compressedJpg);
+        let imageData: Buffer;
+        if (sshConfig) {
+          // Download the file from remote host
+          const localFile = path.join(TMP_ROOT_DIR, `ui-view-${ts}-compressed.jpg`);
+          await downloadFileSSH(compressedJpg, localFile);
+          imageData = fs.readFileSync(localFile);
+          
+          // Clean up remote files
+          await run("rm", [rawPng, compressedJpg]);
+        } else {
+          imageData = fs.readFileSync(compressedJpg);
+        }
         const base64Data = imageData.toString("base64");
 
         return {
@@ -545,8 +773,16 @@ function ensureAbsolutePath(filePath: string): string {
     return path.join(os.homedir(), filePath.slice(2));
   }
 
-  // For relative paths, use ~/Downloads as default directory
-  return path.join(os.homedir(), "Downloads", filePath);
+  // For relative paths, try ~/Downloads first, fall back to system temp
+  const downloadsDir = path.join(os.homedir(), "Downloads");
+  try {
+    // Check if Downloads directory exists and is accessible
+    fs.accessSync(downloadsDir, fs.constants.W_OK);
+    return path.join(downloadsDir, filePath);
+  } catch {
+    // Fall back to system temp directory
+    return path.join(os.tmpdir(), filePath);
+  }
 }
 
 if (!isToolFiltered("screenshot")) {
@@ -589,6 +825,20 @@ if (!isToolFiltered("screenshot")) {
         const actualUdid = await getBootedDeviceId(udid);
         const absolutePath = ensureAbsolutePath(output_path);
 
+        let remotePath: string;
+        let finalPath: string;
+        
+        if (sshConfig) {
+          // Use remote temp path, then download
+          const ts = Date.now();
+          remotePath = `/tmp/screenshot-${ts}.${type || 'png'}`;
+          finalPath = absolutePath;
+        } else {
+          // Use the final path directly
+          remotePath = absolutePath;
+          finalPath = absolutePath;
+        }
+
         // command is weird, it responds with stderr on success and stdout is blank
         const { stderr: stdout } = await run("xcrun", [
           "simctl",
@@ -602,7 +852,7 @@ if (!isToolFiltered("screenshot")) {
           // to separate the command's options from positional arguments.
           // This prevents the shell from misinterpreting the arguments as options.
           "--",
-          absolutePath,
+          remotePath,
         ]);
 
         // throw if we don't get the expected success message
@@ -610,12 +860,19 @@ if (!isToolFiltered("screenshot")) {
           throw new Error(stdout);
         }
 
+        // If using SSH, download the file to the final location
+        if (sshConfig) {
+          await downloadFileSSH(remotePath, finalPath);
+          // Clean up remote file
+          await run("rm", [remotePath]);
+        }
+
         return {
           isError: false,
           content: [
             {
               type: "text",
-              text: stdout,
+              text: `Screenshot saved to ${finalPath}`,
             },
           ],
         };
@@ -678,52 +935,81 @@ if (!isToolFiltered("record_video")) {
         const defaultFileName = `simulator_recording_${Date.now()}.mp4`;
         const outputFile = ensureAbsolutePath(output_path ?? defaultFileName);
 
-        // Start the recording process
-        const recordingProcess = spawn("xcrun", [
-          "simctl",
-          "io",
-          "booted",
-          "recordVideo",
-          ...(codec ? [`--codec=${codec}`] : []),
-          ...(display ? [`--display=${display}`] : []),
-          ...(mask ? [`--mask=${mask}`] : []),
-          ...(force ? ["--force"] : []),
-          // When passing user-provided values to a command, it's crucial to use `--`
-          // to separate the command's options from positional arguments.
-          // This prevents the shell from misinterpreting the arguments as options.
-          "--",
-          outputFile,
-        ]);
+        let remotePath: string;
+        let finalPath: string;
+        
+        if (sshConfig) {
+          // Use remote temp path for SSH
+          const ts = Date.now();
+          remotePath = `/tmp/simulator_recording_${ts}.mp4`;
+          finalPath = outputFile;
+          sshRecordingInfo = { remotePath, localPath: finalPath };
+        } else {
+          // Use the final path directly for local execution
+          remotePath = outputFile;
+          finalPath = outputFile;
+        }
 
-        // Wait for recording to start
-        await new Promise((resolve, reject) => {
-          let errorOutput = "";
+        if (sshConfig) {
+          // For SSH, we need to start recording on the remote host in background
+          // We'll use sh -c to handle the background process properly
+          await runSSH("sh", [
+            "-c",
+            `nohup xcrun simctl io booted recordVideo ${codec ? `--codec=${codec}` : ''} ${display ? `--display=${display}` : ''} ${mask ? `--mask=${mask}` : ''} ${force ? '--force' : ''} '${remotePath}' > /dev/null 2>&1 &`
+          ]);
+        } else {
+          // Start the recording process locally
+          const recordingProcess = spawn("xcrun", [
+            "simctl",
+            "io",
+            "booted",
+            "recordVideo",
+            ...(codec ? [`--codec=${codec}`] : []),
+            ...(display ? [`--display=${display}`] : []),
+            ...(mask ? [`--mask=${mask}`] : []),
+            ...(force ? ["--force"] : []),
+            // When passing user-provided values to a command, it's crucial to use `--`
+            // to separate the command's options from positional arguments.
+            // This prevents the shell from misinterpreting the arguments as options.
+            "--",
+            outputFile,
+          ]);
 
-          recordingProcess.stderr.on("data", (data) => {
-            const message = data.toString();
-            if (message.includes("Recording started")) {
-              resolve(true);
-            } else {
-              errorOutput += message;
-            }
+          // Wait for recording to start
+          await new Promise((resolve, reject) => {
+            let errorOutput = "";
+
+            recordingProcess.stderr.on("data", (data) => {
+              const message = data.toString();
+              if (message.includes("Recording started")) {
+                resolve(true);
+              } else {
+                errorOutput += message;
+              }
+            });
+
+            // Set timeout for start verification
+            setTimeout(() => {
+              if (recordingProcess.killed) {
+                reject(new Error("Recording process terminated unexpectedly"));
+              } else {
+                resolve(true);
+              }
+            }, 3000);
           });
+        }
 
-          // Set timeout for start verification
-          setTimeout(() => {
-            if (recordingProcess.killed) {
-              reject(new Error("Recording process terminated unexpectedly"));
-            } else {
-              resolve(true);
-            }
-          }, 3000);
-        });
+        // For SSH, wait a moment to ensure the recording has started
+        if (sshConfig) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
 
         return {
           isError: false,
           content: [
             {
               type: "text",
-              text: `Recording started. The video will be saved to: ${outputFile}\nTo stop recording, use the stop_recording command.`,
+              text: `Recording started. The video will be saved to: ${finalPath}\nTo stop recording, use the stop_recording command.`,
             },
           ],
         };
@@ -756,6 +1042,36 @@ if (!isToolFiltered("stop_recording")) {
         // Wait a moment for the video to finalize
         await new Promise((resolve) => setTimeout(resolve, 1000));
 
+        // If using SSH and we have recording info, download the video
+        if (sshConfig && sshRecordingInfo) {
+          try {
+            await downloadFileSSH(sshRecordingInfo.remotePath, sshRecordingInfo.localPath);
+            // Clean up remote file
+            await run("rm", [sshRecordingInfo.remotePath]);
+            const message = `Recording stopped and downloaded to: ${sshRecordingInfo.localPath}`;
+            sshRecordingInfo = null; // Clear the recording info
+            return {
+              isError: false,
+              content: [
+                {
+                  type: "text",
+                  text: message,
+                },
+              ],
+            };
+          } catch (downloadError) {
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: `Recording stopped but failed to download video: ${toError(downloadError).message}`,
+                },
+              ],
+            };
+          }
+        }
+
         return {
           isError: false,
           content: [
@@ -779,6 +1095,222 @@ if (!isToolFiltered("stop_recording")) {
         };
       }
     }
+  );
+}
+
+if (!isToolFiltered("simulator_stop")) {
+  server.tool(
+    "simulator_stop",
+    "Stop a running iOS simulator",
+    {
+      udid: z
+        .string()
+        .regex(UDID_REGEX)
+        .optional()
+        .describe("Udid of target simulator, can also be set with the IDB_UDID env var. If not provided, stops all simulators"),
+    },
+    async ({ udid }) => {
+      try {
+        if (udid) {
+          // Stop specific simulator
+          await run("xcrun", ["simctl", "shutdown", udid]);
+          return {
+            isError: false,
+            content: [
+              {
+                type: "text",
+                text: `Simulator ${udid} stopped successfully`,
+              },
+            ],
+          };
+        } else {
+          // Stop all simulators
+          await run("xcrun", ["simctl", "shutdown", "all"]);
+          return {
+            isError: false,
+            content: [
+              {
+                type: "text",
+                text: "All simulators stopped successfully",
+              },
+            ],
+          };
+        }
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: errorWithTroubleshooting(
+                `Error stopping simulator: ${toError(error).message}`
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+if (!isToolFiltered("simulator_start")) {
+  server.tool(
+    "simulator_start",
+    "Start an iOS simulator",
+    {
+      udid: z
+        .string()
+        .regex(UDID_REGEX)
+        .optional()
+        .describe("Udid of target simulator to start. If not provided, starts the default iPhone 16 Pro"),
+      device_name: z
+        .string()
+        .optional()
+        .describe("Device name to start (e.g., 'iPhone 16 Pro'). Used if udid is not provided"),
+    },
+    async ({ udid, device_name }) => {
+      try {
+        let targetId = udid;
+        
+        if (!targetId) {
+          // If no UDID provided, try to find device by name or use default
+          const deviceToStart = device_name || "iPhone 16 Pro";
+          const { stdout } = await run("xcrun", ["simctl", "list", "devices", "available", "--json"]);
+          const devices = JSON.parse(stdout);
+          
+          // Find the device by name
+          for (const runtime in devices.devices) {
+            const runtimeDevices = devices.devices[runtime];
+            const device = runtimeDevices.find((d: any) => d.name === deviceToStart);
+            if (device) {
+              targetId = device.udid;
+              break;
+            }
+          }
+          
+          if (!targetId) {
+            throw new Error(`Device "${deviceToStart}" not found`);
+          }
+        }
+        
+        await run("xcrun", ["simctl", "boot", targetId]);
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: `Simulator ${targetId} started successfully`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: errorWithTroubleshooting(
+                `Error starting simulator: ${toError(error).message}`
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+if (!isToolFiltered("simulator_restart")) {
+  server.tool(
+    "simulator_restart",
+    "Restart an iOS simulator (stop and start)",
+    {
+      udid: z
+        .string()
+        .regex(UDID_REGEX)
+        .optional()
+        .describe("Udid of target simulator to restart. If not provided, restarts the currently booted simulator"),
+      device_name: z
+        .string()
+        .optional()
+        .describe("Device name to restart (e.g., 'iPhone 16 Pro'). Used if udid is not provided"),
+    },
+    async ({ udid, device_name }) => {
+      try {
+        let targetId = udid;
+        
+        if (!targetId) {
+          try {
+            // Try to get currently booted device
+            targetId = await getBootedDeviceId(undefined);
+          } catch {
+            // If no booted device, find by name or use default
+            const deviceToRestart = device_name || "iPhone 16 Pro";
+            const { stdout } = await run("xcrun", ["simctl", "list", "devices", "available", "--json"]);
+            const devices = JSON.parse(stdout);
+            
+            for (const runtime in devices.devices) {
+              const runtimeDevices = devices.devices[runtime];
+              const device = runtimeDevices.find((d: any) => d.name === deviceToRestart);
+              if (device) {
+                targetId = device.udid;
+                break;
+              }
+            }
+            
+            if (!targetId) {
+              throw new Error(`Device "${deviceToRestart}" not found`);
+            }
+          }
+        }
+        
+        // Stop the simulator
+        await run("xcrun", ["simctl", "shutdown", targetId]);
+        
+        // Wait a moment for clean shutdown
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Start the simulator
+        await run("xcrun", ["simctl", "boot", targetId]);
+        
+        return {
+          isError: false,
+          content: [
+            {
+              type: "text",
+              text: `Simulator ${targetId} restarted successfully`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: errorWithTroubleshooting(
+                `Error restarting simulator: ${toError(error).message}`
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+}
+
+// Add the setup tool
+if (!isToolFiltered("setup_remote_host")) {
+  const setupTool = createSetupTool({
+    sshConfig,
+    runSSH: sshConfig ? runSSH : undefined
+  });
+  
+  server.tool(
+    setupTool.name,
+    setupTool.description,
+    setupTool.inputSchema,
+    setupTool.handler
   );
 }
 
