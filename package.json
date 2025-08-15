@@ -1,13 +1,13 @@
 {
-  "name": "ios-simulator-mcp",
+  "name": "@secforge/ios-simulator-mcp",
   "version": "1.4.1",
-  "description": "MCP server for interacting with the iOS simulator",
+  "description": "MCP server for interacting with iOS simulators locally or remotely via SSH",
   "bin": {
     "ios-simulator-mcp": "./build/index.js"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/joshuayoes/ios-simulator-mcp.git"
+    "url": "https://github.com/secforge/ios-simulator-mcp.git"
   },
   "files": [
     "build",
@@ -15,6 +15,7 @@
   ],
   "scripts": {
     "prepare": "npm run build",
+    "postinstall": "npm run build",
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
     "start": "node build/index.js",
     "watch": "tsc --watch",
@@ -25,7 +26,10 @@
     "ios",
     "simulator",
     "mcp",
-    "modelcontextprotocol"
+    "modelcontextprotocol",
+    "ssh",
+    "remote",
+    "wsl"
   ],
   "author": {
     "name": "Joshua Yoes",
@@ -34,11 +38,13 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.0",
+    "ssh2": "^1.15.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@modelcontextprotocol/inspector": "^0.4.1",
     "@types/node": "^22.13.5",
+    "@types/ssh2": "^1.15.0",
     "typescript": "^5.7.3"
   }
 }
