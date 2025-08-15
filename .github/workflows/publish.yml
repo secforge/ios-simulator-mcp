@@ -5,6 +5,7 @@ on:
     types: [published]
 jobs:
   build:
+    environment: npm-publish-steffen
     runs-on: ubuntu-latest
     permissions:
       contents: read
