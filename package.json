@@ -1,6 +1,6 @@
 {
   "name": "@secforge/ios-simulator-mcp",
-  "version": "1.4.1",
+  "version": "1.5.1",
   "description": "MCP server for interacting with iOS simulators locally or remotely via SSH",
   "bin": {
     "ios-simulator-mcp": "./build/index.js"
