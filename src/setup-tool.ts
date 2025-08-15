@@ -9,6 +9,11 @@ export interface SetupToolConfig {
   runSSH?: (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string; }>;
 }
 
+// Cache for tool paths to avoid repeated detection
+let cachedBrewPath: string | null = null;
+let cachedPython3Path: string | null = null;
+let cachedPip3Path: string | null = null;
+
 export function createSetupTool(config: SetupToolConfig) {
   return {
     name: "setup_remote_host",
@@ -71,6 +76,30 @@ export function createSetupTool(config: SetupToolConfig) {
             return stdout;
           }
         };
+
+        // Generic tool detection function
+        const detectToolPath = async (toolName: string, candidates: string[], cache: { value: string | null }): Promise<string> => {
+          if (cache.value) return cache.value;
+          
+          for (const path of candidates) {
+            try {
+              await runRemoteCommand(`which ${path} >/dev/null 2>&1`);
+              cache.value = path;
+              return path;
+            } catch { /* continue */ }
+          }
+          throw new Error(`${toolName} not found in any expected location`);
+        };
+
+        // Cache objects for tool paths
+        const brewCache = { value: cachedBrewPath };
+        const python3Cache = { value: cachedPython3Path };
+        const pip3Cache = { value: cachedPip3Path };
+
+        // Tool detection functions
+        const getBrewPath = () => detectToolPath('Homebrew', ['brew', '/opt/homebrew/bin/brew', '/usr/local/bin/brew'], brewCache);
+        const getPython3Path = () => detectToolPath('Python3', ['python3', '/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3'], python3Cache);
+        const getPip3Path = () => detectToolPath('pip3', ['pip3', '/opt/homebrew/bin/pip3', '/usr/local/bin/pip3'], pip3Cache);
 
         const actionsNeeded: string[] = [];
         const missingRequirements: string[] = [];
@@ -135,77 +164,95 @@ export function createSetupTool(config: SetupToolConfig) {
 
         // Check Homebrew
         log("Checking Homebrew...");
-        if (await runRemoteCheck("PATH=/opt/homebrew/bin:$PATH which brew")) {
+        try {
+          const brewPath = await getBrewPath();
           log("Homebrew installed");
           try {
-            const brewVersion = await runRemoteCommand("PATH=/opt/homebrew/bin:$PATH brew --version 2>/dev/null | head -1");
+            const brewVersion = await runRemoteCommand(`${brewPath} --version 2>/dev/null | head -1`);
             log(`  Version: ${brewVersion.trim() || "unknown"}`);
           } catch {
             log("  Version: unknown");
           }
           
-          // Check if Homebrew is in PATH via shell profiles
+          // Check if Homebrew is in default PATH
           if (!(await runRemoteCheck("which brew"))) {
-            if (!(await runRemoteCheck("(test -f ~/.zshrc && grep -q '/opt/homebrew/bin' ~/.zshrc) || (test -f ~/.bash_profile && grep -q '/opt/homebrew/bin' ~/.bash_profile)"))) {
-              actionsNeeded.push("Add /opt/homebrew/bin to PATH in shell profiles");
-            }
+            actionsNeeded.push("Add Homebrew to PATH in shell profiles");
           }
-        } else {
+        } catch {
           log("Homebrew missing");
           actionsNeeded.push("Install Homebrew package manager");
         }
 
         // Check Python3
         log("Checking Python3...");
-        if (await runRemoteCheck("which python3")) {
+        try {
+          const python3Path = await getPython3Path();
           log("Python3 installed");
           try {
-            const pythonVersion = await runRemoteCommand("python3 --version 2>/dev/null");
+            const pythonVersion = await runRemoteCommand(`${python3Path} --version 2>/dev/null`);
             log(`  Version: ${pythonVersion.trim() || "unknown"}`);
           } catch {
             log("  Version: unknown");
           }
-        } else {
+        } catch {
           log("Python3 missing");
           actionsNeeded.push("Install Python3 via Homebrew");
         }
 
         // Check pip3
         log("Checking pip3...");
-        if (await runRemoteCheck("which pip3")) {
+        try {
+          const pip3Path = await getPip3Path();
           log("pip3 available");
           try {
-            const pipVersion = await runRemoteCommand("pip3 --version 2>/dev/null");
+            const pipVersion = await runRemoteCommand(`${pip3Path} --version 2>/dev/null`);
             log(`  Version: ${pipVersion.trim() || "unknown"}`);
           } catch {
             log("  Version: unknown");
           }
-        } else {
+        } catch {
           log("pip3 missing");
           actionsNeeded.push("Configure pip3 for Python3");
         }
 
         // Check idb-companion
         log("Checking idb-companion...");
-        if (await runRemoteCheck("PATH=/opt/homebrew/bin:$PATH brew list idb-companion") ||
-            await runRemoteCheck("which idb_companion")) {
-          log("idb-companion installed");
-        } else {
-          log("idb-companion missing");
-          actionsNeeded.push("Install idb-companion via Homebrew");
+        try {
+          const brewPath = await getBrewPath();
+          if (await runRemoteCheck(`${brewPath} list idb-companion >/dev/null 2>&1`) ||
+              await runRemoteCheck("which idb_companion")) {
+            log("idb-companion installed");
+          } else {
+            log("idb-companion missing");
+            actionsNeeded.push("Install idb-companion via Homebrew");
+          }
+        } catch {
+          // If brew not found, just check for idb_companion binary
+          if (await runRemoteCheck("which idb_companion")) {
+            log("idb-companion installed");
+          } else {
+            log("idb-companion missing");
+            actionsNeeded.push("Install idb-companion via Homebrew");
+          }
         }
 
         // Check fb-idb Python package
         log("Checking fb-idb...");
-        if (await runRemoteCheck("pip3 show fb-idb")) {
-          log("fb-idb installed");
-          try {
-            const idbVersion = await runRemoteCommand("pip3 show fb-idb 2>/dev/null | grep Version");
-            log(`  ${idbVersion.trim() || "Version: unknown"}`);
-          } catch {
-            log("  Version: unknown");
+        try {
+          const pip3Path = await getPip3Path();
+          if (await runRemoteCheck(`${pip3Path} show fb-idb >/dev/null 2>&1`)) {
+            log("fb-idb installed");
+            try {
+              const idbVersion = await runRemoteCommand(`${pip3Path} show fb-idb 2>/dev/null | grep Version`);
+              log(`  ${idbVersion.trim() || "Version: unknown"}`);
+            } catch {
+              log("  Version: unknown");
+            }
+          } else {
+            log("fb-idb missing");
+            actionsNeeded.push("Install fb-idb Python package");
           }
-        } else {
+        } catch {
           log("fb-idb missing");
           actionsNeeded.push("Install fb-idb Python package");
         }
@@ -214,16 +261,24 @@ export function createSetupTool(config: SetupToolConfig) {
         log("Checking idb command...");
         if (await runRemoteCheck("which idb")) {
           log("idb command in PATH");
-        } else if (await runRemoteCheck("python3 -c 'import idb'")) {
-          log("idb module available");
-          
-          // Check if Python bin is in PATH via shell profiles
-          if (!(await runRemoteCheck("(test -f ~/.zshrc && grep -q '/.local/bin' ~/.zshrc) || (test -f ~/.bash_profile && grep -q '/.local/bin' ~/.bash_profile)"))) {
-            actionsNeeded.push("Add Python bin directory to PATH for idb command");
-          }
         } else {
-          log("idb not accessible");
-          // This will be resolved by installing fb-idb
+          try {
+            const python3Path = await getPython3Path();
+            if (await runRemoteCheck(`${python3Path} -c 'import idb' >/dev/null 2>&1`)) {
+              log("idb module available");
+              
+              // Check if Python bin is in PATH via shell profiles
+              if (!(await runRemoteCheck("(test -f ~/.zshrc && grep -q '/.local/bin' ~/.zshrc) || (test -f ~/.bash_profile && grep -q '/.local/bin' ~/.bash_profile)"))) {
+                actionsNeeded.push("Add Python bin directory to PATH for idb command");
+              }
+            } else {
+              log("idb not accessible");
+              // This will be resolved by installing fb-idb
+            }
+          } catch {
+            log("idb not accessible");
+            // This will be resolved by installing fb-idb
+          }
         }
 
         // Check idb_companion daemon
@@ -338,9 +393,14 @@ export function createSetupTool(config: SetupToolConfig) {
             await runRemoteCommand('/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"');
             log("Homebrew installed successfully");
             
+            // Clear cache and detect new installation
+            brewCache.value = null;
+            const brewPath = await getBrewPath();
+            const brewDir = brewPath.replace('/brew', '');
+            
             // Add to PATH
-            await runRemoteCommand('grep -q "/opt/homebrew/bin" ~/.zshrc 2>/dev/null || echo "export PATH=/opt/homebrew/bin:$PATH" >> ~/.zshrc');
-            await runRemoteCommand('grep -q "/opt/homebrew/bin" ~/.bash_profile 2>/dev/null || echo "export PATH=/opt/homebrew/bin:$PATH" >> ~/.bash_profile');
+            await runRemoteCommand(`grep -q "${brewDir}" ~/.zshrc 2>/dev/null || echo "export PATH=${brewDir}:$PATH" >> ~/.zshrc`);
+            await runRemoteCommand(`grep -q "${brewDir}" ~/.bash_profile 2>/dev/null || echo "export PATH=${brewDir}:$PATH" >> ~/.bash_profile`);
           } catch (error) {
             log("Homebrew installation failed");
             throw error;
@@ -348,12 +408,19 @@ export function createSetupTool(config: SetupToolConfig) {
         }
 
         // Fix Homebrew PATH if needed
-        if (actionsNeeded.includes("Add /opt/homebrew/bin to PATH in shell profiles")) {
+        if (actionsNeeded.includes("Add Homebrew to PATH in shell profiles")) {
           log("");
           log("Adding Homebrew to PATH...");
-          await runRemoteCommand('grep -q "/opt/homebrew/bin" ~/.zshrc 2>/dev/null || echo "export PATH=/opt/homebrew/bin:$PATH" >> ~/.zshrc');
-          await runRemoteCommand('grep -q "/opt/homebrew/bin" ~/.bash_profile 2>/dev/null || echo "export PATH=/opt/homebrew/bin:$PATH" >> ~/.bash_profile');
-          log("PATH updated");
+          try {
+            const brewPath = await getBrewPath();
+            const brewDir = brewPath.replace('/brew', '');
+            await runRemoteCommand(`grep -q "${brewDir}" ~/.zshrc 2>/dev/null || echo "export PATH=${brewDir}:$PATH" >> ~/.zshrc`);
+            await runRemoteCommand(`grep -q "${brewDir}" ~/.bash_profile 2>/dev/null || echo "export PATH=${brewDir}:$PATH" >> ~/.bash_profile`);
+            log("PATH updated");
+          } catch (error) {
+            log("Failed to update PATH");
+            throw error;
+          }
         }
 
         // Install Python3 if needed
@@ -361,8 +428,13 @@ export function createSetupTool(config: SetupToolConfig) {
           log("");
           log("Installing Python3...");
           try {
-            await runRemoteCommand("PATH=/opt/homebrew/bin:$PATH brew install python3");
+            const brewPath = await getBrewPath();
+            await runRemoteCommand(`${brewPath} install python3`);
             log("Python3 installed successfully");
+            
+            // Clear cache to detect new installation
+            python3Cache.value = null;
+            pip3Cache.value = null;
           } catch (error) {
             log("Python3 installation failed");
             throw error;
@@ -374,8 +446,12 @@ export function createSetupTool(config: SetupToolConfig) {
           log("");
           log("Configuring pip3...");
           try {
-            await runRemoteCommand("python3 -m ensurepip --upgrade");
+            const python3Path = await getPython3Path();
+            await runRemoteCommand(`${python3Path} -m ensurepip --upgrade`);
             log("pip3 configured successfully");
+            
+            // Clear cache to detect new installation
+            pip3Cache.value = null;
           } catch (error) {
             log("pip3 configuration failed");
             throw error;
@@ -387,7 +463,8 @@ export function createSetupTool(config: SetupToolConfig) {
           log("");
           log("Installing idb-companion...");
           try {
-            await runRemoteCommand("PATH=/opt/homebrew/bin:$PATH brew install idb-companion");
+            const brewPath = await getBrewPath();
+            await runRemoteCommand(`${brewPath} install idb-companion`);
             log("idb-companion installed successfully");
           } catch (error) {
             log("idb-companion installation failed");
@@ -400,7 +477,8 @@ export function createSetupTool(config: SetupToolConfig) {
           log("");
           log("Installing fb-idb...");
           try {
-            await runRemoteCommand("pip3 install fb-idb");
+            const pip3Path = await getPip3Path();
+            await runRemoteCommand(`${pip3Path} install fb-idb`);
             log("fb-idb installed successfully");
           } catch (error) {
             log("fb-idb installation failed");
@@ -486,6 +564,11 @@ export function createSetupTool(config: SetupToolConfig) {
         log("1. Configure SSH environment variables for this MCP server");
         log("2. Test with: 'Take a screenshot of the iOS simulator'");
         log("3. Try UI interactions: 'Tap on the Settings app'");
+
+        // Update global cache after successful setup
+        cachedBrewPath = brewCache.value;
+        cachedPython3Path = python3Cache.value;
+        cachedPip3Path = pip3Cache.value;
 
         return {
           content: [
