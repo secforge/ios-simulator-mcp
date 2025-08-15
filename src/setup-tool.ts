@@ -19,14 +19,14 @@ export function createSetupTool(config: SetupToolConfig) {
     name: "setup_remote_host",
     description: "Setup a remote macOS host for iOS Simulator MCP by installing required tools",
     inputSchema: {
-      host: z.string().describe("macOS host IP or hostname"),
-      username: z.string().describe("SSH username"),
+      host: z.string().optional().describe("macOS host IP or hostname (uses SSH config if not provided)"),
+      username: z.string().optional().describe("SSH username (uses SSH config if not provided)"),
       dry_run: z.boolean().optional().describe("Only check what needs to be done, don't make changes"),
       auto_confirm: z.boolean().optional().describe("Apply changes without asking for confirmation"),
     },
     handler: async ({ host, username, dry_run = false, auto_confirm = false }: {
-      host: string;
-      username: string;
+      host?: string;
+      username?: string;
       dry_run?: boolean;
       auto_confirm?: boolean;
     }) => {
@@ -36,13 +36,22 @@ export function createSetupTool(config: SetupToolConfig) {
           output += message + "\n";
         };
 
+        // Get actual SSH config if available, or use provided parameters
+        const actualHost = config.sshConfig?.host || host;
+        const actualUsername = config.sshConfig?.username || username;
+        
+        // Validate that we have connection details
+        if (!actualHost || !actualUsername) {
+          throw new Error("SSH connection details not available. Please provide host and username parameters or configure SSH environment variables.");
+        }
+        
         if (dry_run) {
           log("DRY RUN: Analyzing macOS host configuration...");
         } else {
           log("Setting up macOS host for iOS Simulator MCP...");
         }
-        log(`Host: ${host}`);
-        log(`User: ${username}`);
+        log(`Host: ${actualHost}`);
+        log(`User: ${actualUsername}`);
         log("");
 
         // Helper function to run SSH commands
