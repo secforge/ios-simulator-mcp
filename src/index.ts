@@ -125,41 +125,57 @@ async function getSSHConnection(): Promise<Client> {
 
 /**
  * Executes a command over SSH with proper shell environment using connection pooling
+ * Includes automatic retry on connection failures
  */
-async function sshExec(command: string): Promise<{ stdout: string; stderr: string }> {
-  const conn = await getSSHConnection();
-  
-  return new Promise((resolve, reject) => {
-    const fullCommand = `source ~/.zshrc 2>/dev/null || source ~/.bash_profile 2>/dev/null || true; ${command}`;
-    conn.exec(fullCommand, (err, stream) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-
-      let stdout = '';
-      let stderr = '';
-
-      stream.on('close', (code: number) => {
-        if (code === 0) {
-          resolve({
-            stdout: stdout.trim(),
-            stderr: stderr.trim(),
-          });
-        } else {
-          reject(new Error(`Command failed with exit code ${code}: ${stderr || stdout}`));
+async function sshExec(command: string, retryCount = 0): Promise<{ stdout: string; stderr: string }> {
+  try {
+    const conn = await getSSHConnection();
+    
+    return new Promise((resolve, reject) => {
+      const fullCommand = `source ~/.zshrc 2>/dev/null || source ~/.bash_profile 2>/dev/null || true; ${command}`;
+      conn.exec(fullCommand, (err, stream) => {
+        if (err) {
+          // Connection may have broken, clear the pool and retry once
+          if (retryCount === 0 && (err.message.includes('Not connected') || err.message.includes('connection'))) {
+            sshConnectionPool = null;
+            sshExec(command, retryCount + 1).then(resolve, reject);
+            return;
+          }
+          reject(err);
+          return;
         }
-      });
 
-      stream.on('data', (data: Buffer) => {
-        stdout += data.toString();
-      });
+        let stdout = '';
+        let stderr = '';
 
-      stream.stderr?.on('data', (data: Buffer) => {
-        stderr += data.toString();
+        stream.on('close', (code: number) => {
+          if (code === 0) {
+            resolve({
+              stdout: stdout.trim(),
+              stderr: stderr.trim(),
+            });
+          } else {
+            reject(new Error(`Command failed with exit code ${code}: ${stderr || stdout}`));
+          }
+        });
+
+        stream.on('data', (data: Buffer) => {
+          stdout += data.toString();
+        });
+
+        stream.stderr?.on('data', (data: Buffer) => {
+          stderr += data.toString();
+        });
       });
     });
-  });
+  } catch (error) {
+    // Connection establishment failed, retry once if first attempt
+    if (retryCount === 0) {
+      sshConnectionPool = null;
+      return sshExec(command, retryCount + 1);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -303,26 +319,42 @@ async function runSSH(
 
 /**
  * Downloads a file from the remote macOS host via SSH using connection pooling
+ * Includes automatic retry on connection failures
  */
-async function downloadFileSSH(remotePath: string, localPath: string): Promise<void> {
-  const conn = await getSSHConnection();
-  
-  return new Promise((resolve, reject) => {
-    conn.sftp((err, sftp) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-
-      sftp.fastGet(remotePath, localPath, (err) => {
+async function downloadFileSSH(remotePath: string, localPath: string, retryCount = 0): Promise<void> {
+  try {
+    const conn = await getSSHConnection();
+    
+    return new Promise((resolve, reject) => {
+      conn.sftp((err, sftp) => {
         if (err) {
+          // Connection may have broken, clear the pool and retry once
+          if (retryCount === 0 && (err.message.includes('Not connected') || err.message.includes('connection'))) {
+            sshConnectionPool = null;
+            downloadFileSSH(remotePath, localPath, retryCount + 1).then(resolve, reject);
+            return;
+          }
           reject(err);
-        } else {
-          resolve();
+          return;
         }
+
+        sftp.fastGet(remotePath, localPath, (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
       });
     });
-  });
+  } catch (error) {
+    // Connection establishment failed, retry once if first attempt
+    if (retryCount === 0) {
+      sshConnectionPool = null;
+      return downloadFileSSH(remotePath, localPath, retryCount + 1);
+    }
+    throw error;
+  }
 }
 
 // Read filtered tools from environment variable
