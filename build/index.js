@@ -56,46 +56,81 @@ function createSSHConnectionOptions() {
     }
     return connectOptions;
 }
+// SSH Connection Pool
+let sshConnectionPool = null;
+let sshConnectionPromise = null;
 /**
- * Executes a command over SSH with proper shell environment
+ * Gets or creates a persistent SSH connection
  */
-async function sshExec(command) {
-    return new Promise((resolve, reject) => {
+async function getSSHConnection() {
+    if (sshConnectionPool && sshConnectionPool._sock && !sshConnectionPool._sock.destroyed) {
+        return sshConnectionPool;
+    }
+    // If connection is already being established, wait for it
+    if (sshConnectionPromise) {
+        return sshConnectionPromise;
+    }
+    sshConnectionPromise = new Promise((resolve, reject) => {
         const conn = new ssh2_1.Client();
         conn.on('ready', () => {
-            const fullCommand = `source ~/.zshrc 2>/dev/null || source ~/.bash_profile 2>/dev/null || true; ${command}`;
-            conn.exec(fullCommand, (err, stream) => {
-                if (err) {
-                    conn.end();
-                    reject(err);
-                    return;
-                }
-                let stdout = '';
-                let stderr = '';
-                stream.on('close', (code) => {
-                    conn.end();
-                    if (code === 0) {
-                        resolve({
-                            stdout: stdout.trim(),
-                            stderr: stderr.trim(),
-                        });
-                    }
-                    else {
-                        reject(new Error(`Command failed with exit code ${code}: ${stderr || stdout}`));
-                    }
-                });
-                stream.on('data', (data) => {
-                    stdout += data.toString();
-                });
-                stream.stderr?.on('data', (data) => {
-                    stderr += data.toString();
-                });
-            });
+            sshConnectionPool = conn;
+            sshConnectionPromise = null;
+            resolve(conn);
         });
         conn.on('error', (err) => {
+            sshConnectionPool = null;
+            sshConnectionPromise = null;
             reject(err);
         });
-        conn.connect(createSSHConnectionOptions());
+        conn.on('end', () => {
+            sshConnectionPool = null;
+        });
+        conn.on('close', () => {
+            sshConnectionPool = null;
+        });
+        try {
+            conn.connect(createSSHConnectionOptions());
+        }
+        catch (error) {
+            sshConnectionPool = null;
+            sshConnectionPromise = null;
+            reject(error);
+        }
+    });
+    return sshConnectionPromise;
+}
+/**
+ * Executes a command over SSH with proper shell environment using connection pooling
+ */
+async function sshExec(command) {
+    const conn = await getSSHConnection();
+    return new Promise((resolve, reject) => {
+        const fullCommand = `source ~/.zshrc 2>/dev/null || source ~/.bash_profile 2>/dev/null || true; ${command}`;
+        conn.exec(fullCommand, (err, stream) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+            let stdout = '';
+            let stderr = '';
+            stream.on('close', (code) => {
+                if (code === 0) {
+                    resolve({
+                        stdout: stdout.trim(),
+                        stderr: stderr.trim(),
+                    });
+                }
+                else {
+                    reject(new Error(`Command failed with exit code ${code}: ${stderr || stdout}`));
+                }
+            });
+            stream.on('data', (data) => {
+                stdout += data.toString();
+            });
+            stream.stderr?.on('data', (data) => {
+                stderr += data.toString();
+            });
+        });
     });
 }
 /**
@@ -219,33 +254,25 @@ async function runSSH(cmd, args) {
     }
 }
 /**
- * Downloads a file from the remote macOS host via SSH
+ * Downloads a file from the remote macOS host via SSH using connection pooling
  */
 async function downloadFileSSH(remotePath, localPath) {
+    const conn = await getSSHConnection();
     return new Promise((resolve, reject) => {
-        const conn = new ssh2_1.Client();
-        conn.on('ready', () => {
-            conn.sftp((err, sftp) => {
+        conn.sftp((err, sftp) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+            sftp.fastGet(remotePath, localPath, (err) => {
                 if (err) {
-                    conn.end();
                     reject(err);
-                    return;
                 }
-                sftp.fastGet(remotePath, localPath, (err) => {
-                    conn.end();
-                    if (err) {
-                        reject(err);
-                    }
-                    else {
-                        resolve();
-                    }
-                });
+                else {
+                    resolve();
+                }
             });
         });
-        conn.on('error', (err) => {
-            reject(err);
-        });
-        conn.connect(createSSHConnectionOptions());
     });
 }
 // Read filtered tools from environment variable
@@ -1131,6 +1158,10 @@ runServer().catch(console.error);
 process.stdin.on("close", () => {
     console.log("iOS Simulator MCP Server closed");
     server.close();
+    // Close SSH connection if active
+    if (sshConnectionPool) {
+        sshConnectionPool.end();
+    }
     try {
         fs_1.default.rmSync(TMP_ROOT_DIR, { recursive: true, force: true });
     }
