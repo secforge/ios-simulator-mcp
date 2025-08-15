@@ -11,8 +11,7 @@
   },
   "files": [
     "build",
-    "package.json",
-    "TROUBLESHOOTING.md"
+    "package.json"
   ],
   "scripts": {
     "prepare": "npm run build",

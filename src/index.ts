@@ -37,10 +37,15 @@ function getSSHConfig(): SSHConfig | null {
   const host = process.env.IOS_SIMULATOR_SSH_HOST;
   if (!host) return null;
 
+  const username = process.env.IOS_SIMULATOR_SSH_USERNAME;
+  if (!username) {
+    throw new Error("IOS_SIMULATOR_SSH_USERNAME environment variable is required when using SSH");
+  }
+
   return {
     host,
     port: parseInt(process.env.IOS_SIMULATOR_SSH_PORT || "22"),
-    username: process.env.IOS_SIMULATOR_SSH_USERNAME || "user",
+    username,
     privateKeyPath: process.env.IOS_SIMULATOR_SSH_KEY_PATH,
     password: process.env.IOS_SIMULATOR_SSH_PASSWORD,
   };
