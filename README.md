@@ -1,6 +1,9 @@
 # iOS Simulator MCP Server
 
-[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=ios-simulator&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsImlvcy1zaW11bGF0b3ItbWNwIl19) [![NPM Version](https://img.shields.io/npm/v/ios-simulator-mcp)](https://www.npmjs.com/package/ios-simulator-mcp)
+> **Based on the original work by [Joshua Yoes](https://github.com/joshuayoes/ios-simulator-mcp)**  
+> Thank you to Joshua for creating this excellent MCP server foundation.
+
+[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=ios-simulator&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBzZWNmb3JnZS9pb3Mtc2ltdWxhdG9yLW1jcCJdfQo=) [![NPM Version](https://img.shields.io/npm/v/@secforge/ios-simulator-mcp)](https://www.npmjs.com/package/@secforge/ios-simulator-mcp)
 
 A Model Context Protocol (MCP) server for interacting with iOS simulators. This server allows you to interact with iOS simulators by getting information about them, controlling UI interactions, and inspecting UI elements.
 
@@ -161,7 +164,7 @@ This project has been featured and mentioned in various publications and resourc
    * Format: UUID (8-4-4-4-12 hexadecimal characters)
    */
   udid?: string;
-  /** File path where the screenshot will be saved. If relative, it uses the directory specified by the `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR` env var, or `~/Downloads` if not set. */
+  /** File path where the screenshot will be saved. If relative, it uses the directory specified by the `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR` env var, or `~/Downloads` if not set (falls back to system temp if Downloads doesn't exist). */
   output_path: string;
   /** Image format (png, tiff, bmp, gif, or jpeg). Default is png. */
   type?: "png" | "tiff" | "bmp" | "gif" | "jpeg";
@@ -180,7 +183,7 @@ This project has been featured and mentioned in various publications and resourc
 
 ```typescript
 {
-  /** Optional output path. If not provided, a default name will be used. The file will be saved in the directory specified by `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR` or in `~/Downloads` if the environment variable is not set. */
+  /** Optional output path. If not provided, a default name will be used. The file will be saved in the directory specified by `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR` or in `~/Downloads` if the environment variable is not set (falls back to system temp if Downloads doesn't exist). */
   output_path?: string;
   /** Specifies the codec type: "h264" or "hevc". Default is "hevc". */
   codec?: "h264" | "hevc";
@@ -198,6 +201,27 @@ This project has been featured and mentioned in various publications and resourc
 **Description:** Stops the simulator video recording using killall
 
 **Parameters:** No Parameters
+
+### File Storage
+
+Screenshots and videos are stored using the following logic:
+
+- **Absolute paths** (e.g., `/path/to/file.png`): Used as specified
+- **Home directory paths** (e.g., `~/Pictures/screenshot.png`): Expanded to full path
+- **Relative paths** (e.g., `screenshot.png`): 
+  - First tries: `~/Downloads/screenshot.png`
+  - Falls back to: System temp directory if `~/Downloads` doesn't exist or isn't writable
+
+#### SSH Configuration (Optional)
+
+For remote macOS access via SSH:
+
+- `IOS_SIMULATOR_SSH_HOST`: macOS host IP or hostname
+- `IOS_SIMULATOR_SSH_PORT`: SSH port (default: 22)  
+- `IOS_SIMULATOR_SSH_USERNAME`: SSH username (default: "user")
+- `IOS_SIMULATOR_SSH_KEY_PATH`: Path to SSH private key (recommended)
+- `IOS_SIMULATOR_SSH_PASSWORD`: SSH password (alternative to key)
+- `IOS_SIMULATOR_IDB_PATH`: Custom path to idb command (auto-detected if not specified)
 
 ## 💡 Use Case: QA Step via MCP Tool Calls
 
@@ -254,7 +278,7 @@ After a feature implementation, instruct your AI assistant within its MCP client
 - **Record Video:**
 
   ```
-  Start recording a video of the simulator screen (saves to the default output directory, which is `~/Downloads` unless overridden by `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR`)
+  Start recording a video of the simulator screen (saves to the default output directory, which is `~/Downloads` unless overridden by `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR`, falls back to system temp if Downloads doesn't exist)
   ```
 
 - **Stop Recording:**
@@ -264,10 +288,16 @@ After a feature implementation, instruct your AI assistant within its MCP client
 
 ## Prerequisites
 
+### Local Usage (Direct macOS)
 - Node.js
-- macOS (as iOS simulators are only available on macOS)
-- [Xcode](https://developer.apple.com/xcode/resources/) and iOS simulators installed
+- macOS with [Xcode](https://developer.apple.com/xcode/resources/) and iOS simulators installed
 - Facebook [IDB](https://fbidb.io/) tool [(see install guide)](https://fbidb.io/docs/installation)
+
+### Remote Usage (SSH from WSL/Linux)
+- Node.js on your local WSL/Linux system
+- SSH access to a macOS host with Xcode and iOS simulators
+- Facebook [IDB](https://fbidb.io/) installed on the macOS host
+
 
 ## Installation
 
@@ -279,27 +309,47 @@ Cursor manages MCP servers through its configuration file located at `~/.cursor/
 
 #### Option 1: Using NPX (Recommended)
 
-1.  Edit your Cursor MCP configuration file. You can often open it directly from Cursor or use a command like:
+**For Local Usage (Direct macOS):**
+
+1.  Edit your Cursor MCP configuration file:
     ```bash
-    # Open with your default editor (or use 'code', 'vim', etc.)
     open ~/.cursor/mcp.json
-    # Or use Cursor's command if available
-    # cursor ~/.cursor/mcp.json
     ```
-2.  Add or update the `mcpServers` section with the iOS simulator server configuration:
+2.  Add the iOS simulator server configuration:
     ```json
     {
       "mcpServers": {
-        // ... other servers might be listed here ...
         "ios-simulator": {
           "command": "npx",
-          "args": ["-y", "ios-simulator-mcp"]
+          "args": ["-y", "@secforge/ios-simulator-mcp"]
         }
       }
     }
     ```
-    Ensure the JSON structure is valid, especially if `mcpServers` already exists.
-3.  Restart Cursor for the changes to take effect.
+
+**For Remote Usage (SSH to macOS):**
+
+1.  Edit your Cursor MCP configuration file:
+    ```bash
+    open ~/.cursor/mcp.json
+    ```
+2.  Add the iOS simulator server configuration with SSH environment variables:
+    ```json
+    {
+      "mcpServers": {
+        "ios-simulator": {
+          "command": "npx",
+          "args": ["-y", "@secforge/ios-simulator-mcp"],
+          "env": {
+            "IOS_SIMULATOR_SSH_HOST": "192.168.1.100",
+            "IOS_SIMULATOR_SSH_USERNAME": "developer"
+          }
+        }
+      }
+    }
+    ```
+3.  Use the built-in setup tool by asking your AI assistant: "Setup the remote macOS host for iOS simulator access"
+4.  Restart Cursor for the changes to take effect.
 
 #### Option 2: Local Development
 
@@ -338,11 +388,23 @@ Claude Code CLI can manage MCP servers using the `claude mcp` commands or by edi
 
 #### Option 1: Using NPX (Recommended)
 
-1.  Add the server using the `claude mcp add` command:
-    ```bash
-    claude mcp add ios-simulator npx ios-simulator-mcp
-    ```
-2.  Restart any running Claude Code sessions if necessary.
+**For Local Usage (Direct macOS):**
+
+```bash
+claude mcp add ios-simulator npx @secforge/ios-simulator-mcp
+```
+
+**For Remote Usage (SSH to macOS):**
+
+```bash
+claude mcp add ios-simulator npx @secforge/ios-simulator-mcp \
+    -e "IOS_SIMULATOR_SSH_HOST=192.168.1.100" \
+    -e "IOS_SIMULATOR_SSH_USERNAME=developer"
+```
+
+Then use the built-in setup tool by asking your AI assistant: "Setup the remote macOS host for iOS simulator access"
+
+Restart any running Claude Code sessions if necessary.
 
 #### Option 2: Local Development
 
@@ -361,7 +423,7 @@ Claude Code CLI can manage MCP servers using the `claude mcp` commands or by edi
 | Variable                               | Description                                                                                                                                                                                          | Example                                  |
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
 | `IOS_SIMULATOR_MCP_FILTERED_TOOLS`     | A comma-separated list of tool names to filter out from being registered.                                                                                                                            | `screenshot,record_video,stop_recording` |
-| `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR` | Specifies a default directory for output files like screenshots and video recordings. If not set, `~/Downloads` will be used. This can be handy if your agent has limited access to the file system. | `~/Code/awesome-project/tmp`             |
+| `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR` | Specifies a default directory for output files like screenshots and video recordings. If not set, `~/Downloads` will be used (or system temp directory if Downloads doesn't exist). This can be handy if your agent has limited access to the file system. | `~/Code/awesome-project/tmp`             |
 
 #### Configuration Example
 
