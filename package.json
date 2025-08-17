@@ -15,6 +15,7 @@
   ],
   "scripts": {
     "prepare": "npm run build",
+    "postinstall": "node -e \"try { require('fs').chmodSync('./build/index.js', '755'); } catch (e) { /* ignore */ }\"",
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
     "start": "node build/index.js",
     "watch": "tsc --watch",
