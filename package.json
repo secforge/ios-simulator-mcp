@@ -1,6 +1,6 @@
 {
   "name": "@secforge/ios-simulator-mcp",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "description": "MCP server for interacting with iOS simulators locally or remotely via SSH",
   "bin": {
     "ios-simulator-mcp": "./build/index.js"
@@ -15,6 +15,7 @@
   ],
   "scripts": {
     "prepare": "npm run build",
+    "postinstall": "node -e \"try { require('fs').chmodSync('./build/index.js', '755'); } catch (e) { /* ignore */ }\"",
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
     "start": "node build/index.js",
     "watch": "tsc --watch",
