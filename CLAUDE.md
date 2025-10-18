@@ -27,13 +27,18 @@ npm start
 
 ## Architecture
 
-The entire server implementation is in `src/index.ts` (single file by design). The server:
+The server implementation consists of two main files:
+- `src/index.ts` - Main server implementation (single file by design)
+- `src/setup-tool.ts` - Optional SSH setup tool for remote macOS access
+
+The server:
 - Uses the MCP SDK to expose tools for iOS simulator interaction
 - Wraps `xcrun simctl` and Facebook's `idb` commands
 - Validates all inputs with Zod schemas
 - Implements security best practices with `--` argument separation
 - Supports environment-based tool filtering via `IOS_SIMULATOR_MCP_FILTERED_TOOLS`
 - Handles output paths with `IOS_SIMULATOR_MCP_DEFAULT_OUTPUT_DIR` environment variable
+- **SSH Support**: Can connect to remote macOS hosts for controlling iOS simulators from WSL/Linux environments
 
 ## Available MCP Tools
 
@@ -50,8 +55,12 @@ The server provides these tools (can be filtered via environment variables):
 - `screenshot` - Save screenshot to file
 - `record_video` - Start video recording
 - `stop_recording` - Stop video recording
-- `install_app` - Install an app bundle (.app or .ipa) on the simulator
+- `install_app` - Install an app bundle (.app or .ipa) on the simulator (not supported in SSH mode)
 - `launch_app` - Launch an app by bundle identifier
+- `simulator_start` - Start an iOS simulator (SSH-compatible)
+- `simulator_stop` - Stop a running iOS simulator (SSH-compatible)
+- `simulator_restart` - Restart an iOS simulator (SSH-compatible)
+- `setup_remote_host` - Configure remote macOS host for SSH access (available when SSH is configured)
 
 ## Testing
 
