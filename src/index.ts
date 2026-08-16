@@ -8,6 +8,8 @@ import { z } from "zod";
 import path from "path";
 import os from "os";
 import fs from "fs";
+import { Client } from "ssh2";
+import { createSetupTool } from "./setup-tool.js";
 
 type LaunchArgsInput = {
   udid: string;
@@ -54,6 +56,234 @@ export function buildLaunchArgs({
 
 const execFileAsync = promisify(execFile);
 
+// SSH Configuration
+interface SSHConfig {
+  host: string;
+  port: number;
+  username: string;
+  privateKeyPath?: string;
+  password?: string;
+}
+
+function getSSHConfig(): SSHConfig | null {
+  const host = process.env.IOS_SIMULATOR_SSH_HOST;
+  if (!host) return null;
+
+  const username = process.env.IOS_SIMULATOR_SSH_USERNAME;
+  if (!username) {
+    throw new Error("IOS_SIMULATOR_SSH_USERNAME environment variable is required when using SSH");
+  }
+
+  return {
+    host,
+    port: parseInt(process.env.IOS_SIMULATOR_SSH_PORT || "22"),
+    username,
+    privateKeyPath: process.env.IOS_SIMULATOR_SSH_KEY_PATH,
+    password: process.env.IOS_SIMULATOR_SSH_PASSWORD,
+  };
+}
+
+function createSSHConnectionOptions(sshConfig: SSHConfig) {
+  const connectOptions: any = {
+    host: sshConfig.host,
+    port: sshConfig.port,
+    username: sshConfig.username,
+  };
+
+  if (sshConfig.privateKeyPath) {
+    connectOptions.privateKey = fs.readFileSync(sshConfig.privateKeyPath);
+  } else if (sshConfig.password) {
+    connectOptions.password = sshConfig.password;
+  } else {
+    connectOptions.agent = process.env.SSH_AUTH_SOCK;
+  }
+
+  return connectOptions;
+}
+
+let sshConnectionPool: Client | null = null;
+let sshConnectionPromise: Promise<Client> | null = null;
+
+async function getSSHConnection(sshConfig: SSHConfig): Promise<Client> {
+  if (sshConnectionPool && (sshConnectionPool as any)._sock && !(sshConnectionPool as any)._sock.destroyed) {
+    return sshConnectionPool;
+  }
+
+  if (sshConnectionPromise) {
+    return sshConnectionPromise;
+  }
+
+  sshConnectionPromise = new Promise((resolve, reject) => {
+    const conn = new Client();
+
+    conn.on('ready', () => {
+      sshConnectionPool = conn;
+      sshConnectionPromise = null;
+      resolve(conn);
+    });
+
+    conn.on('error', (err) => {
+      sshConnectionPool = null;
+      sshConnectionPromise = null;
+      reject(err);
+    });
+
+    conn.on('end', () => { sshConnectionPool = null; });
+    conn.on('close', () => { sshConnectionPool = null; });
+
+    try {
+      conn.connect(createSSHConnectionOptions(sshConfig));
+    } catch (error) {
+      sshConnectionPool = null;
+      sshConnectionPromise = null;
+      reject(error);
+    }
+  });
+
+  return sshConnectionPromise;
+}
+
+async function sshExec(sshConfig: SSHConfig, command: string, retryCount = 0): Promise<{ stdout: string; stderr: string }> {
+  try {
+    const conn = await getSSHConnection(sshConfig);
+
+    return new Promise((resolve, reject) => {
+      const fullCommand = `source ~/.zshrc 2>/dev/null || source ~/.bash_profile 2>/dev/null || true; ${command}`;
+      conn.exec(fullCommand, (err, stream) => {
+        if (err) {
+          if (retryCount === 0 && (err.message.includes('Not connected') || err.message.includes('connection'))) {
+            sshConnectionPool = null;
+            sshExec(sshConfig, command, retryCount + 1).then(resolve, reject);
+            return;
+          }
+          reject(err);
+          return;
+        }
+
+        let stdout = '';
+        let stderr = '';
+
+        stream.on('close', (code: number) => {
+          if (code === 0) {
+            resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
+          } else {
+            reject(new Error(`Command failed with exit code ${code}: ${stderr || stdout}`));
+          }
+        });
+
+        stream.on('data', (data: Buffer) => { stdout += data.toString(); });
+        stream.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
+      });
+    });
+  } catch (error) {
+    if (retryCount === 0) {
+      sshConnectionPool = null;
+      return sshExec(sshConfig, command, retryCount + 1);
+    }
+    throw error;
+  }
+}
+
+async function downloadFileSSH(sshConfig: SSHConfig, remotePath: string, localPath: string, retryCount = 0): Promise<void> {
+  try {
+    const conn = await getSSHConnection(sshConfig);
+
+    return new Promise((resolve, reject) => {
+      conn.sftp((err, sftp) => {
+        if (err) {
+          if (retryCount === 0 && (err.message.includes('Not connected') || err.message.includes('connection'))) {
+            sshConnectionPool = null;
+            downloadFileSSH(sshConfig, remotePath, localPath, retryCount + 1).then(resolve, reject);
+            return;
+          }
+          reject(err);
+          return;
+        }
+
+        sftp.fastGet(remotePath, localPath, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    });
+  } catch (error) {
+    if (retryCount === 0) {
+      sshConnectionPool = null;
+      return downloadFileSSH(sshConfig, remotePath, localPath, retryCount + 1);
+    }
+    throw error;
+  }
+}
+
+const sshConfig = getSSHConfig();
+
+let sshRecordingInfo: { remotePath: string; localPath: string } | null = null;
+
+let cachedIdbPath: string | null = null;
+
+async function getIdbPathSSH(): Promise<string> {
+  const customPath = process.env.IOS_SIMULATOR_IDB_PATH;
+  if (customPath) return customPath;
+
+  const commonPaths = ['idb', '/opt/homebrew/bin/idb', '/usr/local/bin/idb'];
+  for (const p of commonPaths) {
+    try {
+      await sshExec(sshConfig!, `which ${p}`);
+      return p;
+    } catch {
+      // continue
+    }
+  }
+
+  try {
+    const { stdout } = await sshExec(sshConfig!, 'python3 -m site --user-base');
+    const pythonIdbPath = `${stdout.trim()}/bin/idb`;
+    await sshExec(sshConfig!, `test -f ${pythonIdbPath}`);
+    return pythonIdbPath;
+  } catch {
+    return 'idb';
+  }
+}
+
+function isSetupRelatedError(error: Error): boolean {
+  const indicators = [
+    'idb: command not found', 'command not found',
+    'xcrun: error: unable to find utility "simctl"',
+    'brew: command not found', 'No such file or directory',
+    'Permission denied', 'Connection refused', 'idb_companion',
+    'Failed to connect to idb companion',
+  ];
+  return indicators.some(i => error.message.toLowerCase().includes(i.toLowerCase()));
+}
+
+function enhanceErrorWithSetupGuidance(error: Error): Error {
+  if (sshConfig && isSetupRelatedError(error)) {
+    return new Error(
+      `Command failed - this may indicate the remote macOS host needs setup.\n\n` +
+      `Try asking your AI assistant: "Setup the remote macOS host for iOS simulator access"\n\n` +
+      `Original error: ${error.message}`
+    );
+  }
+  return error;
+}
+
+async function runSSH(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  try {
+    let finalCmd = cmd;
+    if (cmd === 'idb') {
+      if (!cachedIdbPath) {
+        cachedIdbPath = await getIdbPathSSH();
+      }
+      finalCmd = cachedIdbPath;
+    }
+
+    const escapedArgs = args.map(arg => `'${arg.replace(/'/g, "'\"'\"'")}'`);
+    return sshExec(sshConfig!, `${finalCmd} ${escapedArgs.join(' ')}`);
+  } catch (error) {
+    throw enhanceErrorWithSetupGuidance(error as Error);
+  }
+}
+
 /**
  * Strict UDID/UUID pattern: 8-4-4-4-12 hexadecimal characters (e.g. 37A360EC-75F9-4AEC-8EFA-10F4A58D8CCA)
  */
@@ -81,24 +311,30 @@ async function run(
   args: string[],
   options: RunOptions = {},
 ): Promise<{ stdout: string; stderr: string }> {
-  const mergedEnv = options.env
-    ? { ...process.env, ...options.env }
-    : process.env;
-  const promise = execFileAsync(cmd, args, {
-    shell: false,
-    env: mergedEnv,
-  });
-  if (options.input !== undefined && promise.child.stdin) {
-    // Tolerate EPIPE if the child exits before draining stdin; the promise
-    // still rejects on non-zero exit, so failures are not silenced.
-    promise.child.stdin.on("error", () => {});
-    promise.child.stdin.end(options.input);
+  try {
+    if (sshConfig) {
+      return runSSH(cmd, args);
+    }
+
+    const mergedEnv = options.env
+      ? { ...process.env, ...options.env }
+      : process.env;
+    const promise = execFileAsync(cmd, args, {
+      shell: false,
+      env: mergedEnv,
+    });
+    if (options.input !== undefined && promise.child.stdin) {
+      promise.child.stdin.on("error", () => {});
+      promise.child.stdin.end(options.input);
+    }
+    const { stdout, stderr } = await promise;
+    return {
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+    };
+  } catch (error) {
+    throw enhanceErrorWithSetupGuidance(error as Error);
   }
-  const { stdout, stderr } = await promise;
-  return {
-    stdout: stdout.trim(),
-    stderr: stderr.trim(),
-  };
 }
 
 /**
@@ -135,6 +371,9 @@ function getIdbPath(): string {
  * @see https://fbidb.io/docs/commands for documentation of available idb commands
  */
 async function idb(...args: string[]) {
+  if (sshConfig) {
+    return run("idb", args);
+  }
   return run(getIdbPath(), args);
 }
 
@@ -1578,6 +1817,168 @@ if (!isToolFiltered("list_apps")) {
   );
 }
 
+if (!isToolFiltered("simulator_stop")) {
+  server.registerTool(
+    "simulator_stop",
+    {
+      description: "Stop a running iOS simulator",
+      inputSchema: z.object({
+        udid: z
+          .string()
+          .regex(UDID_REGEX)
+          .optional()
+          .describe("Udid of target simulator. If not provided, stops all simulators"),
+      }),
+      annotations: { title: "Stop Simulator", readOnlyHint: false, openWorldHint: true },
+    },
+    async ({ udid }) => {
+      try {
+        if (udid) {
+          await run("xcrun", ["simctl", "shutdown", udid]);
+          return { isError: false, content: [{ type: "text" as const, text: `Simulator ${udid} stopped successfully` }] };
+        } else {
+          await run("xcrun", ["simctl", "shutdown", "all"]);
+          return { isError: false, content: [{ type: "text" as const, text: "All simulators stopped successfully" }] };
+        }
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: errorWithTroubleshooting(`Error stopping simulator: ${toError(error).message}`) }],
+        };
+      }
+    },
+  );
+}
+
+if (!isToolFiltered("simulator_start")) {
+  server.registerTool(
+    "simulator_start",
+    {
+      description: "Start an iOS simulator",
+      inputSchema: z.object({
+        udid: z
+          .string()
+          .regex(UDID_REGEX)
+          .optional()
+          .describe("Udid of target simulator to start. If not provided, starts the default iPhone 16 Pro"),
+        device_name: z
+          .string()
+          .optional()
+          .describe("Device name to start (e.g., 'iPhone 16 Pro'). Used if udid is not provided"),
+      }),
+      annotations: { title: "Start Simulator", readOnlyHint: false, openWorldHint: true },
+    },
+    async ({ udid, device_name }) => {
+      try {
+        let targetId = udid;
+
+        if (!targetId) {
+          const deviceToStart = device_name || "iPhone 16 Pro";
+          const { stdout } = await run("xcrun", ["simctl", "list", "devices", "available", "--json"]);
+          const devices = JSON.parse(stdout);
+
+          for (const runtime in devices.devices) {
+            const device = devices.devices[runtime].find((d: any) => d.name === deviceToStart);
+            if (device) { targetId = device.udid; break; }
+          }
+
+          if (!targetId) throw new Error(`Device "${deviceToStart}" not found`);
+        }
+
+        await run("xcrun", ["simctl", "boot", targetId]);
+        return { isError: false, content: [{ type: "text" as const, text: `Simulator ${targetId} started successfully` }] };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: errorWithTroubleshooting(`Error starting simulator: ${toError(error).message}`) }],
+        };
+      }
+    },
+  );
+}
+
+if (!isToolFiltered("simulator_restart")) {
+  server.registerTool(
+    "simulator_restart",
+    {
+      description: "Restart an iOS simulator (stop and start)",
+      inputSchema: z.object({
+        udid: z
+          .string()
+          .regex(UDID_REGEX)
+          .optional()
+          .describe("Udid of target simulator to restart. If not provided, restarts the currently booted simulator"),
+        device_name: z
+          .string()
+          .optional()
+          .describe("Device name to restart (e.g., 'iPhone 16 Pro'). Used if udid is not provided"),
+      }),
+      annotations: { title: "Restart Simulator", readOnlyHint: false, openWorldHint: true },
+    },
+    async ({ udid, device_name }) => {
+      try {
+        let targetId = udid;
+
+        if (!targetId) {
+          try {
+            targetId = await getBootedDeviceId(undefined);
+          } catch {
+            const deviceToRestart = device_name || "iPhone 16 Pro";
+            const { stdout } = await run("xcrun", ["simctl", "list", "devices", "available", "--json"]);
+            const devices = JSON.parse(stdout);
+
+            for (const runtime in devices.devices) {
+              const device = devices.devices[runtime].find((d: any) => d.name === deviceToRestart);
+              if (device) { targetId = device.udid; break; }
+            }
+
+            if (!targetId) throw new Error(`Device "${deviceToRestart}" not found`);
+          }
+        }
+
+        await run("xcrun", ["simctl", "shutdown", targetId]);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await run("xcrun", ["simctl", "boot", targetId]);
+
+        return { isError: false, content: [{ type: "text" as const, text: `Simulator ${targetId} restarted successfully` }] };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: errorWithTroubleshooting(`Error restarting simulator: ${toError(error).message}`) }],
+        };
+      }
+    },
+  );
+}
+
+if (!isToolFiltered("setup_remote_host")) {
+  const setupTool = createSetupTool({
+    sshConfig,
+    runSSH: sshConfig ? runSSH : undefined,
+  });
+
+  server.registerTool(
+    setupTool.name,
+    {
+      description: setupTool.description,
+      inputSchema: z.object(setupTool.inputSchema),
+      annotations: { title: "Setup Remote Host", readOnlyHint: false, openWorldHint: true },
+    },
+    async (args: any) => {
+      try {
+        return await setupTool.handler(args);
+      } catch (error) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Setup failed: ${error instanceof Error ? error.message : String(error)}\n\nPlease check SSH connectivity and ensure you can manually SSH to the host.`,
+          }],
+        };
+      }
+    },
+  );
+}
+
 async function runServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -1588,6 +1989,11 @@ runServer().catch(console.error);
 process.stdin.on("close", () => {
   console.error("iOS Simulator MCP Server closed");
   server.close();
+
+  if (sshConnectionPool) {
+    sshConnectionPool.end();
+  }
+
   try {
     fs.rmSync(TMP_ROOT_DIR, { recursive: true, force: true });
   } catch (error) {
