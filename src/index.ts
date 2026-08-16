@@ -84,10 +84,41 @@ function getSSHConfig(): SSHConfig | null {
 }
 
 function createSSHConnectionOptions(sshConfig: SSHConfig) {
+  const knownHostsPath = path.join(os.homedir(), ".ssh", "known_hosts");
+  const knownHosts = fs.existsSync(knownHostsPath)
+    ? fs.readFileSync(knownHostsPath)
+    : null;
+
   const connectOptions: any = {
     host: sshConfig.host,
     port: sshConfig.port,
     username: sshConfig.username,
+    // Verify host key against ~/.ssh/known_hosts to prevent MITM attacks.
+    // If the host is not in known_hosts, reject the connection with a clear
+    // message — the user must `ssh-keyscan` or manually SSH once first.
+    hostVerifier: (key: Buffer) => {
+      if (!knownHosts) {
+        throw new Error(
+          `Cannot verify SSH host key for ${sshConfig.host}: ~/.ssh/known_hosts not found.\n` +
+          `Run: ssh-keyscan -H ${sshConfig.host} >> ~/.ssh/known_hosts`
+        );
+      }
+      // Check if any known_hosts entry matches by comparing the base64 key.
+      const keyB64 = key.toString("base64");
+      const lines = knownHosts.toString().split("\n");
+      const match = lines.some(line => {
+        const parts = line.trim().split(/\s+/);
+        // known_hosts format: hostname keytype base64key
+        return parts.length >= 3 && parts[2] === keyB64;
+      });
+      if (!match) {
+        throw new Error(
+          `SSH host key for ${sshConfig.host} not found in ~/.ssh/known_hosts.\n` +
+          `Run: ssh-keyscan -H ${sshConfig.host} >> ~/.ssh/known_hosts`
+        );
+      }
+      return true;
+    },
   };
 
   if (sshConfig.privateKeyPath) {

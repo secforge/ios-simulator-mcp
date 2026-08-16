@@ -44,6 +44,16 @@ export function createSetupTool(config: SetupToolConfig) {
         if (!actualHost || !actualUsername) {
           throw new Error("SSH connection details not available. Please provide host and username parameters or configure SSH environment variables.");
         }
+
+        // Guard against SSH flag injection: host and username must not start
+        // with '-' (which ssh would interpret as an option flag) and must
+        // contain only characters valid in hostnames / POSIX usernames.
+        if (!/^[a-zA-Z0-9][\w\-\.]*$/.test(actualHost)) {
+          throw new Error(`Invalid SSH host: ${actualHost}`);
+        }
+        if (!/^[a-zA-Z_][\w\-]*$/.test(actualUsername)) {
+          throw new Error(`Invalid SSH username: ${actualUsername}`);
+        }
         
         if (dry_run) {
           log("DRY RUN: Analyzing macOS host configuration...");
